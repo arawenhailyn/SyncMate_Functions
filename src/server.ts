@@ -4,7 +4,7 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import * as admin from "firebase-admin";
 import { Client } from "pg";
-import { upsertUser } from "./userRepo";
+import { upsertUser, getUserRole } from "./userRepo";
 
 // --- Firebase Admin init ---
 try {
@@ -60,7 +60,8 @@ const requireAuth: express.RequestHandler = async (req: AuthedReq, res, next) =>
 };
 
 // --- Routes ---
-// 1) Exchange Firebase ID token -> httpOnly cookie
+
+// 1) Exchange Firebase ID token -> httpOnly cookie, return role for redirect
 app.post("/sessionLogin", async (req, res) => {
   const { idToken, password } = req.body as { idToken?: string; password?: string };
   if (!idToken) return res.status(400).json({ error: "idToken required" });
@@ -68,26 +69,28 @@ app.post("/sessionLogin", async (req, res) => {
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
 
-    await upsertUser(decoded, { password }); // <-- pass it
+    // Save / update the user (password is optional; only for email+password flow in your demo)
+    await upsertUser(decoded, { password });
 
-    const sessionCookie = await admin.auth()
+    const sessionCookie = await admin
+      .auth()
       .createSessionCookie(idToken, { expiresIn: SESSION_COOKIE_MAX_AGE_MS });
 
     res.cookie(SESSION_COOKIE_NAME, sessionCookie, {
       maxAge: SESSION_COOKIE_MAX_AGE_MS,
       httpOnly: true,
-      secure: isProd,
+      secure: isProd, // HTTPS only in prod
       sameSite: "lax",
       path: "/",
     });
 
-    res.json({ ok: true, uid: decoded.uid });
+    const role = await getUserRole(decoded.uid); // <- fetch role for redirect
+    res.json({ ok: true, uid: decoded.uid, role });
   } catch (e: any) {
     console.error("sessionLogin error:", e?.message || e);
     res.status(401).json({ error: "Invalid ID token" });
   }
 });
-
 
 // 2) Logout: clear cookie (+ revoke tokens best-effort)
 app.post("/logout", async (req, res) => {
@@ -96,7 +99,9 @@ app.post("/logout", async (req, res) => {
     try {
       const decoded = await admin.auth().verifySessionCookie(cookie, true);
       await admin.auth().revokeRefreshTokens(decoded.sub);
-    } catch { /* ignore */ }
+    } catch {
+      // ignore
+    }
   }
   res.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
@@ -107,21 +112,26 @@ app.post("/logout", async (req, res) => {
   res.json({ ok: true });
 });
 
-// 3) Protected route example
-app.get("/me", requireAuth, (req: AuthedReq, res) => {
+// 3) Protected route example (now includes role)
+app.get("/me", requireAuth, async (req: AuthedReq, res) => {
   const u = req.user!;
+  const role = await getUserRole(u.uid);
   res.json({
     uid: u.uid,
     email: u.email,
     name: u.name,
     email_verified: u.email_verified,
     provider: u.firebase?.sign_in_provider,
+    role, // <-- include role
   });
 });
 
 // --- DB Test route ---
 app.get("/dbping", async (_req, res) => {
-  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  const client = new Client({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }, // Supabase SSL
+  });
   try {
     await client.connect();
     const r = await client.query("select now()");
