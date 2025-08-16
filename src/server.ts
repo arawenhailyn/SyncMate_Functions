@@ -3,6 +3,8 @@ import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import * as admin from "firebase-admin";
+import { Client } from "pg";
+import { upsertUser } from "./userRepo";
 
 // --- Firebase Admin init ---
 try {
@@ -60,19 +62,21 @@ const requireAuth: express.RequestHandler = async (req: AuthedReq, res, next) =>
 // --- Routes ---
 // 1) Exchange Firebase ID token -> httpOnly cookie
 app.post("/sessionLogin", async (req, res) => {
-  const { idToken } = req.body as { idToken?: string };
+  const { idToken, password } = req.body as { idToken?: string; password?: string };
   if (!idToken) return res.status(400).json({ error: "idToken required" });
 
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
-    const sessionCookie = await admin
-      .auth()
+
+    await upsertUser(decoded, { password }); // <-- pass it
+
+    const sessionCookie = await admin.auth()
       .createSessionCookie(idToken, { expiresIn: SESSION_COOKIE_MAX_AGE_MS });
 
     res.cookie(SESSION_COOKIE_NAME, sessionCookie, {
       maxAge: SESSION_COOKIE_MAX_AGE_MS,
       httpOnly: true,
-      secure: isProd, // HTTPS only in prod
+      secure: isProd,
       sameSite: "lax",
       path: "/",
     });
@@ -83,6 +87,7 @@ app.post("/sessionLogin", async (req, res) => {
     res.status(401).json({ error: "Invalid ID token" });
   }
 });
+
 
 // 2) Logout: clear cookie (+ revoke tokens best-effort)
 app.post("/logout", async (req, res) => {
@@ -112,6 +117,20 @@ app.get("/me", requireAuth, (req: AuthedReq, res) => {
     email_verified: u.email_verified,
     provider: u.firebase?.sign_in_provider,
   });
+});
+
+// --- DB Test route ---
+app.get("/dbping", async (_req, res) => {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  try {
+    await client.connect();
+    const r = await client.query("select now()");
+    await client.end();
+    res.json({ ok: true, now: r.rows[0].now });
+  } catch (e: any) {
+    console.error("DB connection failed:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.get("/healthz", (_, res) => res.send("ok"));
