@@ -1,22 +1,8 @@
 // src/userRepo.ts
 import type { DecodedIdToken } from "firebase-admin/lib/auth/token-verifier";
-import { Client } from "pg";
+import { db, query } from "./db";
 
 type Role = "dataTeam" | "teamLead";
-
-const client = new Client({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
-let connected = false;
-async function getDb() {
-  if (!connected) {
-    await client.connect();
-    connected = true;
-  }
-  return client;
-}
 
 /**
  * Upserts the user from a Firebase decoded token.
@@ -28,8 +14,6 @@ export async function upsertUser(
   decoded: DecodedIdToken,
   opts?: { password?: string; role?: Role }
 ) {
-  const db = await getDb();
-
   const email = decoded.email ?? null;
   const name = decoded.name ?? null;
   const emailVerified = decoded.email_verified ?? null;
@@ -37,32 +21,47 @@ export async function upsertUser(
   const pw = opts?.password ?? null; // ⚠️ demo only (plain text)
   const role = opts?.role ?? null;   // pass to change role on this login
 
-  await db.query(
-    `
-    INSERT INTO public.users
-      (firebase_uid, email, name, password, email_verified, provider, role, last_login_at)
-    VALUES
-      ($1, $2, $3, $4, $5, $6, COALESCE($7, 'dataTeam'), NOW())
-    ON CONFLICT (firebase_uid) DO UPDATE
-      SET email          = EXCLUDED.email,
-          name           = EXCLUDED.name,
-          password       = EXCLUDED.password,
-          email_verified = EXCLUDED.email_verified,
-          provider       = EXCLUDED.provider,
-          -- keep existing role unless a new non-null role is provided
-          role           = COALESCE(EXCLUDED.role, public.users.role),
-          last_login_at  = NOW()
-    `,
-    [decoded.uid, email, name, pw, emailVerified, provider, role]
-  );
+  console.log(`Upserting user: ${decoded.uid}, email: ${email}, name: ${name}`);
+
+  try {
+    await query(
+      `
+      INSERT INTO public.users
+        (firebase_uid, email, name, password, email_verified, provider, role, last_login_at)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, COALESCE($7, 'dataTeam'), NOW())
+      ON CONFLICT (firebase_uid) DO UPDATE
+        SET email          = EXCLUDED.email,
+            name           = EXCLUDED.name,
+            password       = EXCLUDED.password,
+            email_verified = EXCLUDED.email_verified,
+            provider       = EXCLUDED.provider,
+            -- keep existing role unless a new non-null role is provided
+            role           = COALESCE(EXCLUDED.role, public.users.role),
+            last_login_at  = NOW()
+      `,
+      [decoded.uid, email, name, pw, emailVerified, provider, role]
+    );
+    console.log(`User upserted successfully: ${decoded.uid}`);
+  } catch (error) {
+    console.error(`Failed to upsert user ${decoded.uid}:`, error);
+    throw error;
+  }
 }
 
 /** Helper to read a user's role for redirects/guards */
 export async function getUserRole(firebaseUid: string): Promise<Role | null> {
-  const db = await getDb();
-  const r = await db.query<{ role: Role }>(
-    `SELECT role FROM public.users WHERE firebase_uid = $1`,
-    [firebaseUid]
-  );
-  return r.rows[0]?.role ?? null;
+  try {
+    console.log(`Fetching role for user: ${firebaseUid}`);
+    const result = await query(
+      `SELECT role FROM public.users WHERE firebase_uid = $1`,
+      [firebaseUid]
+    );
+    const role = result.rows[0]?.role ?? null;
+    console.log(`Role for user ${firebaseUid}: ${role}`);
+    return role;
+  } catch (error) {
+    console.error(`Failed to get role for user ${firebaseUid}:`, error);
+    throw error;
+  }
 }

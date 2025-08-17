@@ -1,3 +1,4 @@
+// server.ts - Fixed version with better error handling
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -9,7 +10,6 @@ import { upsertUser, getUserRole } from "./userRepo";
 // --- Firebase Admin init ---
 try {
   if (admin.apps.length === 0) {
-    // Uses GOOGLE_APPLICATION_CREDENTIALS locally, or platform ADC in cloud
     admin.initializeApp();
   }
 } catch (e) {
@@ -34,7 +34,7 @@ const origins = (process.env.CORS_ORIGINS || "")
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // curl/postman
+      if (!origin) return cb(null, true);
       if (origins.length === 0 || origins.includes(origin)) return cb(null, true);
       return cb(new Error("CORS not allowed"), false);
     },
@@ -67,11 +67,21 @@ app.post("/sessionLogin", async (req, res) => {
   if (!idToken) return res.status(400).json({ error: "idToken required" });
 
   try {
+    // Verify Firebase token
     const decoded = await admin.auth().verifyIdToken(idToken);
+    console.log("Firebase token verified for user:", decoded.uid, decoded.email);
 
-    // Save / update the user (password is optional; only for email+password flow in your demo)
-    await upsertUser(decoded, { password });
+    // Save / update the user with separate error handling
+    try {
+      await upsertUser(decoded, { password });
+      console.log("User upserted successfully:", decoded.uid);
+    } catch (dbError: any) {
+      console.error("Database upsert error:", dbError);
+      // Continue with session creation even if DB fails (you might want to change this behavior)
+      // Or return error here: return res.status(500).json({ error: "Database error" });
+    }
 
+    // Create session cookie
     const sessionCookie = await admin
       .auth()
       .createSessionCookie(idToken, { expiresIn: SESSION_COOKIE_MAX_AGE_MS });
@@ -79,12 +89,20 @@ app.post("/sessionLogin", async (req, res) => {
     res.cookie(SESSION_COOKIE_NAME, sessionCookie, {
       maxAge: SESSION_COOKIE_MAX_AGE_MS,
       httpOnly: true,
-      secure: isProd, // HTTPS only in prod
+      secure: isProd,
       sameSite: "lax",
       path: "/",
     });
 
-    const role = await getUserRole(decoded.uid); // <- fetch role for redirect
+    // Fetch role (with fallback if DB is unavailable)
+    let role = 'dataTeam'; // default fallback
+    try {
+      const fetchedRole = await getUserRole(decoded.uid);
+      if (fetchedRole) role = fetchedRole;
+    } catch (roleError) {
+      console.error("Error fetching user role:", roleError);
+    }
+
     res.json({ ok: true, uid: decoded.uid, role });
   } catch (e: any) {
     console.error("sessionLogin error:", e?.message || e);
@@ -115,22 +133,27 @@ app.post("/logout", async (req, res) => {
 // 3) Protected route example (now includes role)
 app.get("/me", requireAuth, async (req: AuthedReq, res) => {
   const u = req.user!;
-  const role = await getUserRole(u.uid);
-  res.json({
-    uid: u.uid,
-    email: u.email,
-    name: u.name,
-    email_verified: u.email_verified,
-    provider: u.firebase?.sign_in_provider,
-    role, // <-- include role
-  });
+  try {
+    const role = await getUserRole(u.uid);
+    res.json({
+      uid: u.uid,
+      email: u.email,
+      name: u.name,
+      email_verified: u.email_verified,
+      provider: u.firebase?.sign_in_provider,
+      role,
+    });
+  } catch (error) {
+    console.error("Error in /me route:", error);
+    res.status(500).json({ error: "Failed to fetch user data" });
+  }
 });
 
 // --- DB Test route ---
 app.get("/dbping", async (_req, res) => {
   const client = new Client({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }, // Supabase SSL
+    ssl: { rejectUnauthorized: false },
   });
   try {
     await client.connect();
