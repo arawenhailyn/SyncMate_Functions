@@ -1,0 +1,9 @@
+{"level":"info","message":"Processing as tabular data","timestamp":"2025-08-24T13:56:00.269Z"}
+{"level":"info","message":"Gemini API call attempt 1/3","timestamp":"2025-08-24T13:56:00.329Z"}
+{"level":"info","message":"Gemini API success in 22646ms","timestamp":"2025-08-24T13:56:22.976Z"}
+{"level":"info","message":"Processing as tabular data","timestamp":"2025-08-24T14:10:17.274Z"}
+{"level":"info","message":"Gemini API call attempt 1/3","timestamp":"2025-08-24T14:10:17.291Z"}
+{"level":"info","message":"Gemini API success in 10036ms","timestamp":"2025-08-24T14:10:27.328Z"}
+{"level":"info","message":"Processing as tabular data","timestamp":"2025-08-24T14:12:31.646Z"}
+{"level":"info","message":"Gemini API call attempt 1/3","timestamp":"2025-08-24T14:12:31.660Z"}
+{"level":"info","message":"Gemini API success in 6996ms","timestamp":"2025-08-24T14:12:38.657Z"}

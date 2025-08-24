@@ -25,23 +25,33 @@ export async function upsertUser(
 
   try {
     await query(
-      `
-      INSERT INTO public.users
-        (firebase_uid, email, name, password, email_verified, provider, role, last_login_at)
-      VALUES
-        ($1, $2, $3, $4, $5, $6, COALESCE($7, 'dataTeam'), NOW())
-      ON CONFLICT (firebase_uid) DO UPDATE
-        SET email          = EXCLUDED.email,
-            name           = EXCLUDED.name,
-            password       = EXCLUDED.password,
-            email_verified = EXCLUDED.email_verified,
-            provider       = EXCLUDED.provider,
-            -- keep existing role unless a new non-null role is provided
-            role           = COALESCE(EXCLUDED.role, public.users.role),
-            last_login_at  = NOW()
-      `,
-      [decoded.uid, email, name, pw, emailVerified, provider, role]
-    );
+  `
+  INSERT INTO public.users
+    (firebase_uid, email, name, password, email_verified, provider, role, last_login_at)
+  VALUES
+    (
+      $1, $2, $3, $4, $5, $6,
+      CASE WHEN $7 IS NULL THEN 'dataTeam' ELSE $7 END,   -- default ON INSERT only
+      NOW()
+    )
+  ON CONFLICT (firebase_uid) DO UPDATE
+    SET
+      email          = EXCLUDED.email,
+      name           = EXCLUDED.name,
+      password       = EXCLUDED.password,
+      email_verified = EXCLUDED.email_verified,
+      provider       = EXCLUDED.provider,
+      -- only change role if a new one was explicitly provided this time
+      role           = CASE
+                         WHEN EXCLUDED.role IS NOT NULL THEN EXCLUDED.role
+                         ELSE public.users.role
+                       END,
+      last_login_at  = NOW()
+  RETURNING firebase_uid, email, role
+  `,
+  [decoded.uid, email, name, pw, emailVerified, provider, role]
+);
+
     console.log(`User upserted successfully: ${decoded.uid}`);
   } catch (error) {
     console.error(`Failed to upsert user ${decoded.uid}:`, error);
