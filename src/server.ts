@@ -1,240 +1,251 @@
 // server.ts
-// Express + Firebase Admin + Postgres + Multer (uploads) + Supabase Storage + Gemini Chatbot
-
+// Express + Firebase Admin + Postgres + Gemini Chatbot
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
+import helmet from "helmet";
+import compression from "compression";
+import morgan from "morgan";
 import * as admin from "firebase-admin";
-import { Client } from "pg";
-import { upsertUser, getUserRole } from "./userRepo";
-import { reportUploadRouter } from "./routes/reportUpload";
-import { chatbotRouter } from "./routes/chatbot";
+import type { Request, Response, NextFunction } from "express";
+import { Router } from "express";
+import { Pool } from "pg";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-// ---------- Firebase Admin init ----------
-try {
-  if (admin.apps.length === 0) {
-    admin.initializeApp();
-  }
-} catch (e) {
-  console.error("Failed to initialize firebase-admin:", e);
-  process.exit(1);
-}
+// ⬇️ NEW: reports upload router (CSV + PDF policies)
+import { reportUploadRouter } from "./routes/reportUpload"; // if you're ESM/NodeNext at runtime, use "./routes/reportUpload.js"
 
+// --- App + config ------------------------------------------------------------
 const app = express();
+const PORT = Number(process.env.PORT ?? 3000);
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN ?? "http://localhost:5173"; // TODO: set for prod
+const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME ?? "__session";
 
-// If behind a proxy (Render/Heroku/Nginx), keep this so secure cookies work
-app.set("trust proxy", 1);
+// --- Postgres ---------------------------------------------------------------
+const pg =
+  process.env.DATABASE_URL
+    ? new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: process.env.PGSSL === "require" ? { rejectUnauthorized: false } : undefined,
+      })
+    : null;
 
-// ---------- Config ----------
-const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || "__session";
-const SESSION_COOKIE_DAYS = Number(process.env.SESSION_COOKIE_DAYS || 5);
-const SESSION_COOKIE_MAX_AGE_MS = SESSION_COOKIE_DAYS * 24 * 60 * 60 * 1000;
-const isProd = process.env.NODE_ENV === "production";
-
-// Validate required environment variables
-const requiredEnvVars = ['GEMINI_API_KEY', 'DATABASE_URL'];
-for (const envVar of requiredEnvVars) {
-  if (!process.env[envVar]) {
-    console.error(`Missing required environment variable: ${envVar}`);
-    process.exit(1);
-  }
+// --- Firebase Admin init ----------------------------------------------------
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.applicationDefault(),
+  });
 }
 
-// ---------- CORS ----------
-const origins = (process.env.CORS_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
+// --- Middleware --------------------------------------------------------------
+app.set("trust proxy", 1);
 app.use(
   cors({
-    origin: (origin, cb) => {
-      // Allow SSR / curl / same-origin proxy (no Origin header)
-      if (!origin) return cb(null, true);
-      if (origins.length === 0 || origins.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS not allowed"), false);
-    },
+    origin: FRONTEND_ORIGIN,
     credentials: true,
   })
 );
-
-// ---------- Body / Cookie parsers ----------
+app.use(helmet());
+app.use(compression());
+app.use(morgan("dev"));
 app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true })); // good for form posts
+app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 
-// ---------- Auth middleware ----------
-type AuthedReq = express.Request & { user?: admin.auth.DecodedIdToken };
-
-const requireAuth: express.RequestHandler = async (req: AuthedReq, res, next) => {
-  const token = req.cookies[SESSION_COOKIE_NAME] || "";
+// --- Auth helper -------------------------------------------------------------
+async function requireAuth(req: Request, res: Response, next: NextFunction) {
   try {
-    const decoded = await admin.auth().verifySessionCookie(token, true);
-    req.user = decoded;
+    const cookie = req.cookies?.[SESSION_COOKIE_NAME];
+    if (!cookie) return res.status(401).json({ error: "No session cookie" });
+    const decoded = await admin.auth().verifySessionCookie(cookie, true);
+    (req as any).user = { uid: decoded.uid, email: decoded.email ?? null };
     next();
   } catch {
-    res.status(401).json({ error: "UNAUTHORIZED" });
+    res.status(401).json({ error: "Invalid or expired session" });
   }
-};
+}
 
-// ============================================================================
-// Routes
-// ============================================================================
+// --- Chatbot router (Gemini + sessions/messages) -----------------------------
+const chatbotRouter = Router();
 
-// 1) Exchange Firebase ID token -> httpOnly cookie, return role for redirect
-app.post("/sessionLogin", async (req, res) => {
-  const { idToken, password } = req.body as { idToken?: string; password?: string };
-  if (!idToken) return res.status(400).json({ error: "idToken required" });
+// Create a new chat session
+chatbotRouter.post("/sessions", requireAuth, async (req, res) => {
+  const id = cryptoRandomId();
+  res.json({ session: { id, title: req.body?.title ?? "New Chat" } });
+});
 
+// Send a message to Gemini
+chatbotRouter.post("/sessions/:id/messages", requireAuth, async (req, res) => {
   try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    console.log("Firebase token verified for user:", decoded.uid, decoded.email);
+    const { id } = req.params;
+    const { message } = req.body as { message: string };
+    if (!message?.trim()) return res.status(400).json({ error: "Empty message" });
 
-    try {
-      await upsertUser(decoded, { password });
-      console.log("User upserted successfully:", decoded.uid);
-    } catch (dbError: any) {
-      console.error("Database upsert error:", dbError);
+    // -------- Build optional context from data_glossary ----------
+    let glossaryBlock = "";
+    if (pg && !process.env.SKIP_GLOSSARY) {
+      try {
+        const withUserJoin = await pg.query(
+          `
+          select dg.term, dg.definition, dg.category
+          from data_glossary dg
+          join uploaded_files uf on uf.id = dg.source_file_id
+          where uf.user_id = $1
+          order by dg.created_at desc
+          limit 30
+        `,
+          [(req as any).user.uid]
+        );
+        if (withUserJoin.rows.length) {
+          glossaryBlock =
+            "\n\nData Glossary:\n" +
+            withUserJoin.rows
+              .map((r) => `- ${r.term}: ${r.definition}${r.category ? ` [${r.category}]` : ""}`)
+              .join("\n");
+        }
+      } catch (e: any) {
+        if (e?.code === "42703" || e?.code === "42P01") {
+          try {
+            const generic = await pg.query(
+              `
+              select term, definition, category
+              from data_glossary
+              order by created_at desc
+              limit 30
+            `
+            );
+            if (generic.rows.length) {
+              glossaryBlock =
+                "\n\nData Glossary:\n" +
+                generic.rows
+                  .map((r) => `- ${r.term}: ${r.definition}${r.category ? ` [${r.category}]` : ""}`)
+                  .join("\n");
+            }
+          } catch (e2: any) {
+            if (e2?.code !== "42P01") throw e2;
+          }
+        } else {
+          throw e;
+        }
+      }
     }
 
-    const sessionCookie = await admin
-      .auth()
-      .createSessionCookie(idToken, { expiresIn: SESSION_COOKIE_MAX_AGE_MS });
+    // TODO: replace with your own context fetch
+    const issuesContext = "Recent compliance context goes here…";
 
-    res.cookie(SESSION_COOKIE_NAME, sessionCookie, {
-      maxAge: SESSION_COOKIE_MAX_AGE_MS,
-      httpOnly: true,
-      secure: isProd,      // set true in production (HTTPS)
-      sameSite: "lax",     // "none" if you serve API on a different top-level site with HTTPS
-      path: "/",
-    });
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
 
-    let role = "dataTeam";
-    try {
-      const fetchedRole = await getUserRole(decoded.uid);
-      if (fetchedRole) role = fetchedRole;
-    } catch (roleError) {
-      console.error("Error fetching user role:", roleError);
-    }
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL ?? "gemini-1.5-flash" });
 
-    res.json({ ok: true, uid: decoded.uid, role });
-  } catch (e: any) {
-    console.error("sessionLogin error:", e?.message || e);
-    res.status(401).json({ error: "Invalid ID token" });
+    const prompt = [
+      "You are a compliance assistant.",
+      "Be concise and actionable.",
+      `Context:\n${issuesContext}${glossaryBlock || ""}`,
+      `User: ${message}`,
+    ].join("\n\n");
+
+    const result = await model.generateContent(prompt);
+    const text = result.response.text();
+
+    res.json({ sessionId: id, response: text });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message ?? "Chat error" });
   }
 });
 
-// 2) Logout
-app.post("/logout", async (req, res) => {
-  const cookie = req.cookies[SESSION_COOKIE_NAME];
-  if (cookie) {
-    try {
-      const decoded = await admin.auth().verifySessionCookie(cookie, true);
-      await admin.auth().revokeRefreshTokens(decoded.sub);
-    } catch {
-      // ignore
-    }
-  }
-  res.clearCookie(SESSION_COOKIE_NAME, {
-    httpOnly: true,
-    secure: isProd,
-    sameSite: "lax",
-    path: "/",
-  });
-  res.json({ ok: true });
-});
+// Helper to generate opaque ids
+function cryptoRandomId() {
+  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
 
-// 3) Protected route example (now includes role)
-app.get("/me", requireAuth, async (req: AuthedReq, res) => {
-  const u = req.user!;
-  try {
-    const role = await getUserRole(u.uid);
-    const payload = {
-      uid: u.uid,
-      email: u.email,
-      name: u.name,
-      email_verified: u.email_verified,
-      provider: u.firebase?.sign_in_provider,
-      role,
-    };
-    console.log("👉 /me response:", payload);
-    res.json(payload);
-  } catch (error) {
-    console.error("Error in /me route:", error);
-    res.status(500).json({ error: "Failed to fetch user data" });
-  }
-});
-
-// ---------- DB Test route ----------
-app.get("/dbping", async (_req, res) => {
-  const client = new Client({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-  });
-  try {
-    await client.connect();
-    const r = await client.query("select now()");
-    await client.end();
-    res.json({ ok: true, now: r.rows[0].now });
-  } catch (e: any) {
-    console.error("DB connection failed:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get("/healthz", (_req, res) => res.send("ok"));
-
-// ============================================================================
-// API Routes
-// ============================================================================
-
-// File Upload Routes
-app.use("/api/reports", reportUploadRouter);
-
-// Chatbot Routes
+// Mount chatbot router
 app.use("/api/chatbot", chatbotRouter);
 
-// Optional: 404 for unknown API paths (helps spot wrong URLs)
-app.use("/api", (_req, res) => {
-  res.status(404).json({ error: "Not Found" });
+// --- ⬇️ NEW: mount the reports upload router BEFORE 404 ----------------------
+app.use("/api/reports", reportUploadRouter);
+// This exposes: POST /api/reports/upload   (field name: "file")
+
+// --- Glossary read API (matches data_glossary shape) -------------------------
+if (pg) {
+  app.get("/api/glossary", requireAuth, async (req, res) => {
+    try {
+      try {
+        const { rows } = await pg.query(
+          `
+          select
+            dg.id,
+            dg.term,
+            dg.definition,
+            dg.category,
+            dg.source_file_id,
+            dg.source_columns,
+            dg.data_types,
+            dg.sample_values,
+            dg.synonyms,
+            dg.confidence,
+            dg.created_at
+          from data_glossary dg
+          join uploaded_files uf on uf.id = dg.source_file_id
+          where uf.user_id = $1
+          order by dg.created_at desc
+          limit 100
+        `,
+          [(req as any).user.uid]
+        );
+        return res.json({ terms: rows });
+      } catch (e: any) {
+        if (e?.code === "42703" || e?.code === "42P01") {
+          const { rows } = await pg.query(
+            `
+            select
+              id, term, definition, category, source_file_id,
+              source_columns, data_types, sample_values, synonyms,
+              confidence, created_at
+            from data_glossary
+            order by created_at desc
+            limit 100
+          `
+          );
+          return res.json({ terms: rows });
+        }
+        throw e;
+      }
+    } catch (e: any) {
+      if (e?.code === "42P01") return res.json({ terms: [] });
+      res.status(500).json({ error: e?.message ?? "Failed to load glossary" });
+    }
+  });
+}
+
+// --- Health ------------------------------------------------------------------
+app.get("/healthz", (_req, res) => {
+  res.json({
+    ok: true,
+    env: {
+      NODE_ENV: process.env.NODE_ENV ?? "dev",
+      hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+      hasDatabase: Boolean(process.env.DATABASE_URL),
+    },
+    time: new Date().toISOString(),
+  });
 });
 
-// ============================================================================
-// Error handler (after routes & multer)
-// ============================================================================
-app.use(
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    console.error("Unhandled error:", err?.message || err);
-    if (err?.message === "Unsupported file type") {
-      return res.status(415).json({ error: "Unsupported file type. Use CSV, Excel, or PDF." });
-    }
-    if (err?.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({ error: "File too large (> 50MB)" });
-    }
-    if (err?.message === "CORS not allowed") {
-      return res.status(403).json({ error: "CORS policy violation" });
-    }
-    return res.status(500).json({ error: "Internal Server Error" });
-  }
-);
+// --- 404 & error handlers ----------------------------------------------------
+app.use((req, res) => res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` }));
 
-// ---------- Graceful shutdown ----------
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  process.exit(0);
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error("[UNCAUGHT]", err);
+  res.status(500).json({ error: "Unexpected server error" });
 });
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down gracefully');
-  process.exit(0);
-});
-
-// ---------- Start ----------
-const port = Number(process.env.PORT || 4000);
+// --- Start -------------------------------------------------------------------
+const port = Number(process.env.PORT || PORT || 4000);
 app.listen(port, () => {
   console.log(`🚀 API server listening on http://localhost:${port}`);
   console.log(`🤖 Chatbot API available at http://localhost:${port}/api/chatbot`);
-  console.log(`📊 Dashboard integration ready`);
+  console.log(`📤 Reports upload at         http://localhost:${port}/api/reports/upload`);
 });
