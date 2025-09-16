@@ -7,15 +7,28 @@ import pdfParse from "pdf-parse";
 import { supabase } from "../lib/supabase"; // if you store raw files; safe to keep even if unused
 import { query } from "../db";              // your PG helper: (sql: string, params?: any[]) => Promise<{ rows: any[] }>
 import { logger } from "../lib/config";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 
-// ------------------ Gemini Setup (from server.ts) ------------------
-const apiKey = process.env.GEMINI_API_KEY;
-let genAI: GoogleGenerativeAI | null = null;
-if (apiKey) {
-  genAI = new GoogleGenerativeAI(apiKey);
-} else {
-  logger?.warn?.("GEMINI_API_KEY not set; falling back to simple extractor");
+// If you already have an extractor, adapt it here:
+let hasExternalExtractor = false;
+let externalExtractor: null | ((text: string) => Promise<ExtractedRule[]>) = null;
+
+try {
+  // Example: either glossaryExtractor exposes createGlossaryExtractor().extractPolicyRules
+  // or backgroundGlossaryProcessor exposes a static extraction util.
+  // Wire whichever exists in your codebase.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { createGlossaryExtractor } = require("../services/glossaryExtractor");
+  const gx = createGlossaryExtractor?.();
+  if (gx?.extractPolicyRules) {
+    hasExternalExtractor = true;
+    externalExtractor = async (text: string) => {
+      const out = await gx.extractPolicyRules(text);
+      // normalize shape below if needed
+      return Array.isArray(out) ? out : [];
+    };
+  }
+} catch {
+  /* no-op: we’ll fall back to a simple splitter */
 }
 
 // ------------------ Types & helpers ------------------
@@ -83,48 +96,8 @@ function detectPdfMeta(filename: string) {
   return { entityCode: null as string | null, period: null as string | null, title: base.replace(/\.pdf$/i, "") };
 }
 
-// ------------------ Gemini-based Extractor ------------------
-async function geminiExtractPolicyRules(text: string): Promise<ExtractedRule[]> {
-  if (!genAI) {
-    throw new Error("Gemini not initialized");
-  }
-
-  const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL ?? "gemini-1.5-flash" });
-
-  const prompt = `
-You are a policy extraction expert. Extract structured rules from the following compliance/policy text.
-For each rule:
-- rule_code: A short unique code (e.g., "SEC-4.2") if present; otherwise null.
-- rule_text: The full text of the rule (1-5 sentences max).
-- citations: Array of any referenced laws/codes (e.g., ["BSP Circular 123", "PD 456"]); empty array if none.
-- tags: Array of keywords/categories (e.g., ["data_privacy", "aml"]); empty array if none.
-- severity: "low", "medium", "high", or null.
-- effective_date: YYYY-MM-DD if mentioned; otherwise null.
-- confidence: 0.0 to 1.0 score of extraction accuracy.
-
-Output ONLY a JSON array of objects matching this structure. No other text.
-Limit to 200 rules max.
-
-Text:
-${text.slice(0, 100000)}  // Truncate if too long for model limits
-`;
-
-  try {
-    const result = await model.generateContent(prompt);
-    const jsonText = result.response.text().trim().replace(/^```json\n|\n```$/g, '');
-    const rules: ExtractedRule[] = JSON.parse(jsonText);
-    return rules.filter(r => r.rule_text?.trim());
-  } catch (err: any) {
-    logger?.error?.(`Gemini extraction failed: ${err.message}`);
-    throw err;
-  }
-}
-
-// Set up external extractor (use Gemini if available, else fallback)
-let hasExternalExtractor = !!genAI;
-let externalExtractor: (text: string) => Promise<ExtractedRule[]> = genAI ? geminiExtractPolicyRules : fallbackExtractPolicyRules;
-
-// Simple fallback extractor (if Gemini not available)
+// Simple fallback extractor (if you haven’t wired your own yet).
+// Splits by lines starting with a bullet/number and keeps 1–5 sentence chunks.
 async function fallbackExtractPolicyRules(text: string): Promise<ExtractedRule[]> {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const chunks: string[] = [];
@@ -161,154 +134,215 @@ async function extractPolicyRules(text: string): Promise<ExtractedRule[]> {
   return fallbackExtractPolicyRules(text);
 }
 
-// ------------------ CSV ingestion ------------------
+// ------------------ CSV ingestion (unchanged from your previous version) ------------------
 async function batchInsert(
   textBuilder: (batchSize: number) => string,
   rows: any[],
-  paramsBuilder: (row: any) => any[]
+  valuesBuilder: (r: any) => any[],
+  batchSize = 1000
 ) {
-  const batchSize = 500;
   for (let i = 0; i < rows.length; i += batchSize) {
     const chunk = rows.slice(i, i + batchSize);
+    if (!chunk.length) continue;
     const sql = textBuilder(chunk.length);
-    const params = chunk.flatMap(paramsBuilder);
+    const params: any[] = [];
+    chunk.forEach((r) => params.push(...valuesBuilder(r)));
     await query(sql, params);
   }
 }
 
-async function insertCompliance(records: Record<string, unknown>[], sourceFile: string) {
-  const rows = records.map(cleanHeaderKeys);
+async function insertCompliance(rows: any[], sourceFile: string) {
+  const normalized = rows.map(cleanHeaderKeys).map((r) => ({
+    check_id: toStr(r["Check_ID"]),
+    policy: toStr(r["Policy"]),
+    status: toStr(r["Status"]),
+    severity: toStr(r["Severity"]),
+    notes: toStr(r["Notes"]),
+    checked_by: toStr(r["Checked_By"]),
+    checked_at: toStr(r["Checked_At"]),
+    entity: toStr(r["Entity"]),
+    period: toStr(r["Period"]),
+    source_file: sourceFile,
+  }));
+
   await batchInsert(
-    (n) => `
-      INSERT INTO compliance_reports (entity, issue_type, description, status, source_file, report_date)
-      VALUES ${Array.from({ length: n }, (_, i) => `($${i * 6 + 1}, $${i * 6 + 2}, $${i * 6 + 3}, $${i * 6 + 4}, $${i * 6 + 5}, $${i * 6 + 6})`).join(",")}
-      ON CONFLICT (id) DO NOTHING  -- Adjust conflict clause if needed (e.g., on a unique column)
-    `,
-    rows,
-    (r) => [
-      toStr(r.entity),
-      toStr(r.issue_type),
-      toStr(r.description),
-      toStr(r.status),
-      sourceFile,
-      toStr(r.report_date) || new Date().toISOString().slice(0, 10), // Default to current date if not provided
-    ]
+    (n) => {
+      const cols = "(check_id,policy,status,severity,notes,checked_by,checked_at,entity,period,source_file)";
+      const groups = Array.from({ length: n }, (_, i) => {
+        const base = i * 10;
+        return `(${Array.from({ length: 10 }, (_, j) => `$${base + j + 1}`).join(",")})`;
+      }).join(",");
+      return `
+        INSERT INTO compliance_reports ${cols} VALUES ${groups}
+        ON CONFLICT (check_id) DO UPDATE
+        SET policy=EXCLUDED.policy,
+            status=EXCLUDED.status,
+            severity=EXCLUDED.severity,
+            notes=EXCLUDED.notes,
+            checked_by=EXCLUDED.checked_by,
+            checked_at=EXCLUDED.checked_at,
+            entity=EXCLUDED.entity,
+            period=EXCLUDED.period,
+            source_file=EXCLUDED.source_file,
+            loaded_at=now();
+      `;
+    },
+    normalized,
+    (r) => [r.check_id, r.policy, r.status, r.severity, r.notes, r.checked_by, r.checked_at, r.entity, r.period, r.source_file]
   );
 }
 
-async function insertCustomers(records: Record<string, unknown>[], sourceFile: string) {
-  const rows = records.map(cleanHeaderKeys);
+async function insertCustomers(rows: any[], sourceFile: string) {
+  const normalized = rows.map(cleanHeaderKeys).map((r) => ({
+    customer_id: toStr(r["Customer_ID"]),
+    name: toStr(r["Name"]),
+    email: toStr(r["Email"]),
+    phone: toStr(r["Phone"]),
+    dob: toStr(r["DOB"]),
+    account_status: toStr(r["Account_Status"]),
+    entity: toStr(r["Entity"]),
+    period: toStr(r["Period"]),
+    source_file: sourceFile,
+  }));
+
   await batchInsert(
-    (n) => `
-      INSERT INTO customer_data_reports (entity, customer_id, name, account_number, status, source_file, report_date)
-      VALUES ${Array.from({ length: n }, (_, i) => `($${i * 7 + 1}, $${i * 7 + 2}, $${i * 7 + 3}, $${i * 7 + 4}, $${i * 7 + 5}, $${i * 7 + 6}, $${i * 7 + 7})`).join(",")}
-      ON CONFLICT (customer_id) DO UPDATE SET
-        entity = EXCLUDED.entity,
-        name = EXCLUDED.name,
-        account_number = EXCLUDED.account_number,
-        status = EXCLUDED.status,
-        source_file = EXCLUDED.source_file,
-        report_date = EXCLUDED.report_date
-    `,
-    rows,
-    (r) => [
-      toStr(r.entity),
-      toStr(r.customer_id),
-      toStr(r.name),
-      toStr(r.account_number),
-      toStr(r.status),
-      sourceFile,
-      toStr(r.report_date) || new Date().toISOString().slice(0, 10), // Default to current date if not provided
-    ]
+    (n) => {
+      const cols = "(customer_id,name,email,phone,dob,account_status,entity,period,source_file)";
+      const groups = Array.from({ length: n }, (_, i) => {
+        const base = i * 9;
+        return `(${Array.from({ length: 9 }, (_, j) => `$${base + j + 1}`).join(",")})`;
+      }).join(",");
+      return `
+        INSERT INTO customer_data_reports ${cols} VALUES ${groups}
+        ON CONFLICT (customer_id) DO UPDATE
+        SET name=EXCLUDED.name,
+            email=EXCLUDED.email,
+            phone=EXCLUDED.phone,
+            dob=EXCLUDED.dob,
+            account_status=EXCLUDED.account_status,
+            entity=EXCLUDED.entity,
+            period=EXCLUDED.period,
+            source_file=EXCLUDED.source_file,
+            loaded_at=now();
+      `;
+    },
+    normalized,
+    (r) => [r.customer_id, r.name, r.email, r.phone, r.dob, r.account_status, r.entity, r.period, r.source_file]
   );
 }
 
-async function insertTransactions(records: Record<string, unknown>[], sourceFile: string) {
-  const rows = records.map(cleanHeaderKeys);
+async function insertTransactions(rows: any[], sourceFile: string) {
+  const normalized = rows.map(cleanHeaderKeys).map((r) => ({
+    txn_id: toStr(r["Txn_ID"]),
+    date: toStr(r["Date"]),
+    account_id: toStr(r["Account_ID"]),
+    amount: toNum(r["Amount"]),
+    currency: toStr(r["Currency"]),
+    txn_type: toStr(r["Txn_Type"]),
+    status: toStr(r["Status"]),
+    counterparty: toStr(r["Counterparty"]),
+    entity: toStr(r["Entity"]),
+    period: toStr(r["Period"]),
+    source_file: sourceFile,
+  }));
+
   await batchInsert(
-    (n) => `
-      INSERT INTO transaction_data_reports (entity, transaction_id, amount, date, status, source_file, report_date)
-      VALUES ${Array.from({ length: n }, (_, i) => `($${i * 7 + 1}, $${i * 7 + 2}, $${i * 7 + 3}, $${i * 7 + 4}, $${i * 7 + 5}, $${i * 7 + 6}, $${i * 7 + 7})`).join(",")}
-      ON CONFLICT (transaction_id) DO UPDATE SET
-        entity = EXCLUDED.entity,
-        amount = EXCLUDED.amount,
-        date = EXCLUDED.date,
-        status = EXCLUDED.status,
-        source_file = EXCLUDED.source_file,
-        report_date = EXCLUDED.report_date
-    `,
-    rows,
-    (r) => [
-      toStr(r.entity),
-      toStr(r.transaction_id),
-      toNum(r.amount),
-      toStr(r.date),
-      toStr(r.status),
-      sourceFile,
-      toStr(r.report_date) || new Date().toISOString().slice(0, 10),
-    ]
+    (n) => {
+      const cols = "(txn_id,date,account_id,amount,currency,txn_type,status,counterparty,entity,period,source_file)";
+      const groups = Array.from({ length: n }, (_, i) => {
+        const base = i * 11;
+        return `(${Array.from({ length: 11 }, (_, j) => `$${base + j + 1}`).join(",")})`;
+      }).join(",");
+      return `
+        INSERT INTO transaction_reports ${cols} VALUES ${groups}
+        ON CONFLICT (txn_id) DO UPDATE
+        SET date=EXCLUDED.date,
+            account_id=EXCLUDED.account_id,
+            amount=EXCLUDED.amount,
+            currency=EXCLUDED.currency,
+            txn_type=EXCLUDED.txn_type,
+            status=EXCLUDED.status,
+            counterparty=EXCLUDED.counterparty,
+            entity=EXCLUDED.entity,
+            period=EXCLUDED.period,
+            source_file=EXCLUDED.source_file,
+            loaded_at=now();
+      `;
+    },
+    normalized,
+    (r) => [r.txn_id, r.date, r.account_id, r.amount, r.currency, r.txn_type, r.status, r.counterparty, r.entity, r.period, r.source_file]
   );
 }
 
-async function insertRisk(records: Record<string, unknown>[], sourceFile: string) {
-  const rows = records.map(cleanHeaderKeys);
+async function insertRisk(rows: any[], sourceFile: string) {
+  const normalized = rows.map(cleanHeaderKeys).map((r) => ({
+    risk_id: toStr(r["Risk_ID"]),
+    risk_category: toStr(r["Risk_Category"]),
+    description: toStr(r["Description"]),
+    likelihood: toNum(r["Likelihood"]),
+    impact: toNum(r["Impact"]),
+    score: toNum(r["Score"]),
+    owner: toStr(r["Owner"]),
+    mitigation: toStr(r["Mitigation"]),
+    review_date: toStr(r["Review_Date"]),
+    entity: toStr(r["Entity"]),
+    period: toStr(r["Period"]),
+    source_file: sourceFile,
+  }));
+
   await batchInsert(
-    (n) => `
-      INSERT INTO risk_assessment_reports (entity, risk_id, risk_type, score, mitigation, source_file, report_date)
-      VALUES ${Array.from({ length: n }, (_, i) => `($${i * 7 + 1}, $${i * 7 + 2}, $${i * 7 + 3}, $${i * 7 + 4}, $${i * 7 + 5}, $${i * 7 + 6}, $${i * 7 + 7})`).join(",")}
-      ON CONFLICT (risk_id) DO UPDATE SET
-        entity = EXCLUDED.entity,
-        risk_type = EXCLUDED.risk_type,
-        score = EXCLUDED.score,
-        mitigation = EXCLUDED.mitigation,
-        source_file = EXCLUDED.source_file,
-        report_date = EXCLUDED.report_date
-    `,
-    rows,
-    (r) => [
-      toStr(r.entity),
-      toStr(r.risk_id),
-      toStr(r.risk_type),
-      toNum(r.score),
-      toStr(r.mitigation),
-      sourceFile,
-      toStr(r.report_date) || new Date().toISOString().slice(0, 10),
-    ]
+    (n) => {
+      const cols = "(risk_id,risk_category,description,likelihood,impact,score,owner,mitigation,review_date,entity,period,source_file)";
+      const groups = Array.from({ length: n }, (_, i) => {
+        const base = i * 12;
+        return `(${Array.from({ length: 12 }, (_, j) => `$${base + j + 1}`).join(",")})`;
+      }).join(",");
+      return `
+        INSERT INTO risk_assessment_reports ${cols} VALUES ${groups}
+        ON CONFLICT (risk_id) DO UPDATE
+        SET risk_category=EXCLUDED.risk_category,
+            description=EXCLUDED.description,
+            likelihood=EXCLUDED.likelihood,
+            impact=EXCLUDED.impact,
+            score=EXCLUDED.score,
+            owner=EXCLUDED.owner,
+            mitigation=EXCLUDED.mitigation,
+            review_date=EXCLUDED.review_date,
+            entity=EXCLUDED.entity,
+            period=EXCLUDED.period,
+            source_file=EXCLUDED.source_file,
+            loaded_at=now();
+      `;
+    },
+    normalized,
+    (r) => [r.risk_id, r.risk_category, r.description, r.likelihood, r.impact, r.score, r.owner, r.mitigation, r.review_date, r.entity, r.period, r.source_file]
   );
 }
 
-// ------------------ PDF helpers ------------------
-async function upsertUploadedFileRow({
-  checksum,
-  originalName,
-  mime,
-  size,
-  storedPath,
-  pageCount,
-}: {
+// ------------------ uploaded_files helpers ------------------
+async function upsertUploadedFileRow(args: {
   checksum: string;
   originalName: string;
   mime: string;
   size: number;
   storedPath: string | null;
-  pageCount: number | null;
+  pageCount?: number | null;
 }) {
-  logger?.info?.(`Attempting to upsert file: ${originalName}, checksum: ${checksum}`);
-  const { rows } = await query(
-    `
-      INSERT INTO uploaded_files (checksum, filename, mime_type, file_size, file_path, page_count)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (checksum) DO UPDATE SET
-        filename = EXCLUDED.filename,
-        mime_type = EXCLUDED.mime_type,
-        file_size = EXCLUDED.file_size,
-        file_path = EXCLUDED.file_path,
-        page_count = EXCLUDED.page_count
-      RETURNING id
-    `,
-    [checksum, originalName, mime, size, storedPath, pageCount ?? null]
-  );
-  logger?.info?.(`Upsert result: ${JSON.stringify(rows)}`);
+  const { checksum, originalName, mime, size, storedPath, pageCount } = args;
+
+  // If you already have more columns, extend here.
+  const sql = `
+    INSERT INTO uploaded_files (checksum, filename, mime_type, byte_size, storage_path, page_count, created_at)
+    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+    ON CONFLICT (checksum) DO UPDATE
+       SET filename = EXCLUDED.filename,
+           mime_type = EXCLUDED.mime_type,
+           byte_size = EXCLUDED.byte_size,
+           storage_path = EXCLUDED.storage_path,
+           page_count = COALESCE(EXCLUDED.page_count, uploaded_files.page_count)
+    RETURNING id;
+  `;
+  const { rows } = await query(sql, [checksum, originalName, mime, size, storedPath, pageCount ?? null]);
   return rows[0]?.id as string;
 }
 
@@ -394,7 +428,7 @@ router.post("/upload", upload.single("file"), async (req: Request, res: Response
         pageCount: parsed.numpages ?? null,
       });
 
-      // extract rules (Gemini or fallback)
+      // extract rules (external or fallback)
       const rules = (await extractPolicyRules(text))
         .map((r) => ({
           ...r,

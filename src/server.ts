@@ -218,40 +218,19 @@ if (pg) {
       res.status(500).json({ error: e?.message ?? "Failed to load glossary" });
     }
   });
-  app.get('/api/reports', requireAuth, async (req, res) => {
-  try {
-    const { rows } = await pg.query(
-      `
-        SELECT 
-          id,
-          filename AS name,
-          entity,
-          uploaded_by AS uploadedBy,
-          upload_date AS uploadDate,
-          processing_status AS status,
-          file_size AS issues  -- Assuming issues can be approximated by file_size for now
-        FROM uploaded_files
-        WHERE entity IS NOT NULL
-        ORDER BY upload_date DESC
-        LIMIT 10
-      `
-    );
-    res.json(rows);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
 }
 
 // --- Health ------------------------------------------------------------------
-app.get("/healthz/db", async (_req, res) => {
-  try {
-    if (!pg) return res.status(500).json({ ok: false, error: "No database configured" });
-    await pg.query("SELECT 1");
-    res.json({ ok: true, message: "Database connection successful" });
-  } catch (err: any) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+app.get("/healthz", (_req, res) => {
+  res.json({
+    ok: true,
+    env: {
+      NODE_ENV: process.env.NODE_ENV ?? "dev",
+      hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+      hasDatabase: Boolean(process.env.DATABASE_URL),
+    },
+    time: new Date().toISOString(),
+  });
 });
 
 // --- 404 & error handlers ----------------------------------------------------
